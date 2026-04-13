@@ -16,6 +16,7 @@ const challanItemSchema = new mongoose.Schema({
     unit: { type: String, default: 'PCS' },
     sellingPrice: { type: Number, default: 0 },
     mrp: Number,
+    discountAmount: { type: Number, default: 0 },
     gstRate: { type: Number, default: 0 },
     taxableAmount: Number,
     taxAmount: Number,
