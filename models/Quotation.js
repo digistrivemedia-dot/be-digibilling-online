@@ -29,6 +29,7 @@ const quotationItemSchema = new mongoose.Schema({
     sellingPrice: { type: Number, required: true, default: 0 },
     mrp: Number,
     discount: { type: Number, default: 0 },
+    discountAmount: { type: Number, default: 0 },
     gstRate: { type: Number, required: true, default: 0 },
     taxableAmount: Number,
     taxAmount: Number,

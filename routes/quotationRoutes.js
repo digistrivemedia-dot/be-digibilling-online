@@ -128,14 +128,14 @@ router.post('/', async (req, res) => {
             };
         });
 
-        // Recalculate totals server-side
-        const subtotal = processedItems.reduce((s, i) => s + i.taxableAmount, 0);
+        // Recalculate totals server-side (subtotal = pre-discount, discount = sum of item discounts)
+        const subtotal = processedItems.reduce((s, i) => s + (i.sellingPrice || 0) * (i.quantity || 0), 0);
+        const totalItemDiscount = processedItems.reduce((s, i) => s + (i.discountAmount || 0), 0);
         const totalTax = processedItems.reduce((s, i) => s + i.taxAmount, 0);
         const totalCGST = taxType === 'CGST_SGST' ? processedItems.reduce((s, i) => s + (i.cgst || 0), 0) : 0;
         const totalSGST = taxType === 'CGST_SGST' ? processedItems.reduce((s, i) => s + (i.sgst || 0), 0) : 0;
         const totalIGST = taxType === 'IGST' ? processedItems.reduce((s, i) => s + (i.igst || 0), 0) : 0;
-        const discountAmt = Number(data.discount) || 0;
-        const grandTotalRaw = subtotal + totalTax - discountAmt;
+        const grandTotalRaw = subtotal - totalItemDiscount + totalTax;
         const roundOff = Math.round(grandTotalRaw) - grandTotalRaw;
         const grandTotal = Math.round(grandTotalRaw);
 
@@ -159,7 +159,7 @@ router.post('/', async (req, res) => {
             totalCGST,
             totalSGST,
             totalIGST,
-            discount: discountAmt,
+            discount: totalItemDiscount,
             roundOff,
             grandTotal,
             notes: data.notes,
@@ -230,13 +230,13 @@ router.put('/:id', async (req, res) => {
             };
         });
 
-        const subtotal = processedItems.reduce((s, i) => s + i.taxableAmount, 0);
+        const subtotal = processedItems.reduce((s, i) => s + (i.sellingPrice || 0) * (i.quantity || 0), 0);
+        const totalItemDiscount = processedItems.reduce((s, i) => s + (i.discountAmount || 0), 0);
         const totalTax = processedItems.reduce((s, i) => s + i.taxAmount, 0);
         const totalCGST = taxType === 'CGST_SGST' ? processedItems.reduce((s, i) => s + (i.cgst || 0), 0) : 0;
         const totalSGST = taxType === 'CGST_SGST' ? processedItems.reduce((s, i) => s + (i.sgst || 0), 0) : 0;
         const totalIGST = taxType === 'IGST' ? processedItems.reduce((s, i) => s + (i.igst || 0), 0) : 0;
-        const discountAmt = data.discount !== undefined ? Number(data.discount) : existing.discount;
-        const grandTotalRaw = subtotal + totalTax - discountAmt;
+        const grandTotalRaw = subtotal - totalItemDiscount + totalTax;
         const roundOff = Math.round(grandTotalRaw) - grandTotalRaw;
         const grandTotal = Math.round(grandTotalRaw);
 
@@ -261,7 +261,7 @@ router.put('/:id', async (req, res) => {
                     totalCGST,
                     totalSGST,
                     totalIGST,
-                    discount: discountAmt,
+                    discount: totalItemDiscount,
                     roundOff,
                     grandTotal,
                     notes: data.notes ?? existing.notes,
