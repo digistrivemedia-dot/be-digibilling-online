@@ -10,11 +10,14 @@ router.use(tenantIsolation);
 
 // ── Helper: calculate item GST ─────────────────────────────────────────────
 const calcItem = (item, taxType, gstScheme = 'REGULAR') => {
-    const taxable = (item.sellingPrice || 0) * (item.quantity || 1);
+    const gross = (item.sellingPrice || 0) * (item.quantity || 1);
+    const discountAmt = item.discountAmount || 0;
+    const taxable = gross - discountAmt;
     // Composition scheme: no GST charged to customer
     const taxAmt = gstScheme === 'COMPOSITION' ? 0 : (taxable * (item.gstRate || 0)) / 100;
     const half = taxAmt / 2;
     return {
+        discountAmount: discountAmt,
         taxableAmount: taxable,
         taxAmount: taxAmt,
         cgst: taxType === 'CGST_SGST' ? half : 0,
@@ -56,17 +59,19 @@ const processItems = (items = [], taxType = 'CGST_SGST', gstScheme = 'REGULAR') 
     });
 };
 
-const calcTotals = (processedItems, taxType, discountAmt, gstScheme = 'REGULAR') => {
-    const subtotal = processedItems.reduce((s, i) => s + i.taxableAmount, 0);
+const calcTotals = (processedItems, taxType, gstScheme = 'REGULAR') => {
+    // subtotal = pre-discount (sum of price × qty), discount = sum of item discounts
+    const subtotal = processedItems.reduce((s, i) => s + (i.sellingPrice || 0) * (i.quantity || 1), 0);
+    const totalItemDiscount = processedItems.reduce((s, i) => s + (i.discountAmount || 0), 0);
     // Composition scheme: no GST in totals
     const totalTax = gstScheme === 'COMPOSITION' ? 0 : processedItems.reduce((s, i) => s + i.taxAmount, 0);
     const totalCGST = gstScheme === 'COMPOSITION' ? 0 : (taxType === 'CGST_SGST' ? processedItems.reduce((s, i) => s + (i.cgst || 0), 0) : 0);
     const totalSGST = gstScheme === 'COMPOSITION' ? 0 : (taxType === 'CGST_SGST' ? processedItems.reduce((s, i) => s + (i.sgst || 0), 0) : 0);
     const totalIGST = gstScheme === 'COMPOSITION' ? 0 : (taxType === 'IGST' ? processedItems.reduce((s, i) => s + (i.igst || 0), 0) : 0);
-    const grandTotalRaw = subtotal + totalTax - discountAmt;
+    const grandTotalRaw = subtotal - totalItemDiscount + totalTax;
     const roundOff = Math.round(grandTotalRaw) - grandTotalRaw;
     const grandTotal = Math.round(grandTotalRaw);
-    return { subtotal, totalTax, totalCGST, totalSGST, totalIGST, roundOff, grandTotal };
+    return { subtotal, discount: totalItemDiscount, totalTax, totalCGST, totalSGST, totalIGST, roundOff, grandTotal };
 };
 
 // ── GET /api/proforma-invoices ─────────────────────────────────────────────
@@ -120,8 +125,7 @@ router.post('/', async (req, res) => {
         const shopSettings = await ShopSettings.findOne({ organizationId: req.organizationId || req.user.organizationId }).lean();
         const gstScheme = shopSettings?.gstScheme || 'REGULAR';
         const processedItems = processItems(items, taxType, gstScheme);
-        const discountAmt = Number(data.discount) || 0;
-        const totals = calcTotals(processedItems, taxType, discountAmt, gstScheme);
+        const totals = calcTotals(processedItems, taxType, gstScheme);
 
         const doc = new ProformaInvoice({
             organizationId: req.organizationId || req.user.organizationId,
@@ -137,7 +141,6 @@ router.post('/', async (req, res) => {
             status: data.status || 'DRAFT',
             items: processedItems,
             taxType,
-            discount: discountAmt,
             ...totals,
             notes: data.notes,
             terms: data.terms,
@@ -190,8 +193,7 @@ router.put('/:id', async (req, res) => {
         const shopSettings = await ShopSettings.findOne({ organizationId: req.organizationId || req.user.organizationId }).lean();
         const gstScheme = shopSettings?.gstScheme || 'REGULAR';
         const processedItems = processItems(items, taxType, gstScheme);
-        const discountAmt = data.discount !== undefined ? Number(data.discount) : existing.discount;
-        const totals = calcTotals(processedItems, taxType, discountAmt, gstScheme);
+        const totals = calcTotals(processedItems, taxType, gstScheme);
 
         const updated = await ProformaInvoice.findByIdAndUpdate(
             existing._id,
@@ -208,7 +210,6 @@ router.put('/:id', async (req, res) => {
                     status: data.status || existing.status,
                     items: processedItems,
                     taxType,
-                    discount: discountAmt,
                     ...totals,
                     notes: data.notes ?? existing.notes,
                     terms: data.terms ?? existing.terms,
