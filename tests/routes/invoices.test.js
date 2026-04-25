@@ -1,8 +1,13 @@
-import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest';
 import request from 'supertest';
 import { connectTestDB, disconnectTestDB, clearCollections } from '../helpers/db.js';
 import { setupTestUser, createTestCustomer } from '../helpers/fixtures.js';
 import createApp from '../helpers/testApp.js';
+
+// Suppress console.error so intentional 401/error tests don't pollute test output.
+// The middleware correctly catches these errors and returns proper HTTP responses —
+// the console.error inside auth.js is just noise during testing.
+vi.spyOn(console, 'error').mockImplementation(() => {});
 
 let app;
 let authHeader;

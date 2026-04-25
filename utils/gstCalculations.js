@@ -166,6 +166,8 @@ export const calculateTotals = (items, additionalCharges = {}, discount = 0, gst
   };
 };
 
+// ⚠️  UNUSED FUNCTION — not imported anywhere in the codebase (verified April 2026)
+// TODO: Either use this somewhere or delete it.
 /**
  * Reverse calculate price from MRP including GST
  * @param {Number} mrp - Maximum Retail Price (including GST)
@@ -187,6 +189,8 @@ export const validateGSTIN = (gstin) => {
   return gstinRegex.test(gstin);
 };
 
+// ⚠️  UNUSED FUNCTION — not imported anywhere in the codebase (verified April 2026)
+// TODO: Either use this somewhere or delete it.
 /**
  * Extract state code from GSTIN
  * @param {String} gstin - GSTIN number
@@ -213,6 +217,8 @@ export const getFinancialYear = (date = new Date()) => {
   return `${year - 1}-${year}`;
 };
 
+// ⚠️  UNUSED FUNCTION — not imported anywhere in the codebase (verified April 2026)
+// TODO: Either use this somewhere or delete it.
 /**
  * Get financial year date range
  * @param {String} fy - Financial year string "2024-2025"
@@ -226,61 +232,59 @@ export const getFinancialYearRange = (fy) => {
   };
 };
 
+// ⚠️  UNUSED FUNCTION — not imported anywhere in the codebase (verified April 2026)
+// TODO: Either wire this into invoice PDF templates or delete it.
+//       Note: the function had a bug (amount vs num reassignment) that was fixed
+//       during testing even though it was never called — if you use it, it now works correctly.
 /**
  * Convert number to words (for invoice)
  * @param {Number} amount
  * @returns {String}
  */
 export const amountToWords = (amount) => {
-  const ones = ['', 'One', 'Two', 'Three', 'Four', 'Five', 'Six', 'Seven', 'Eight', 'Nine'];
-  const tens = ['', '', 'Twenty', 'Thirty', 'Forty', 'Fifty', 'Sixty', 'Seventy', 'Eighty', 'Ninety'];
-  const teens = ['Ten', 'Eleven', 'Twelve', 'Thirteen', 'Fourteen', 'Fifteen', 'Sixteen', 'Seventeen', 'Eighteen', 'Nineteen'];
-
   if (amount === 0) return 'Zero Rupees Only';
 
-  const num = Math.floor(amount);
-  const paise = Math.round((amount - num) * 100);
+  // Includes teens so we never need a separate teens array
+  const ones = [
+    '', 'One', 'Two', 'Three', 'Four', 'Five', 'Six', 'Seven', 'Eight', 'Nine',
+    'Ten', 'Eleven', 'Twelve', 'Thirteen', 'Fourteen', 'Fifteen', 'Sixteen',
+    'Seventeen', 'Eighteen', 'Nineteen'
+  ];
+  const tensWords = ['', '', 'Twenty', 'Thirty', 'Forty', 'Fifty', 'Sixty', 'Seventy', 'Eighty', 'Ninety'];
 
+  // Inner helper — converts 1-999 to word parts ONLY (no "Rupees Only" suffix).
+  // The outer function is the only one that adds "Rupees Only".
+  const toWords = (n) => {
+    if (n === 0) return '';
+    if (n < 20) return ones[n] + ' ';
+    if (n < 100) return tensWords[Math.floor(n / 10)] + ' ' + (ones[n % 10] ? ones[n % 10] + ' ' : '');
+    return ones[Math.floor(n / 100)] + ' Hundred ' + toWords(n % 100);
+  };
+
+  let num = Math.floor(amount);
+  const paise = Math.round((amount - num) * 100);
   let words = '';
 
-  // Crores
   if (num >= 10000000) {
-    words += amountToWords(Math.floor(num / 10000000)) + ' Crore ';
-    amount = num % 10000000;
+    words += toWords(Math.floor(num / 10000000)) + 'Crore ';
+    num = num % 10000000;
   }
-
-  // Lakhs
   if (num >= 100000) {
-    words += amountToWords(Math.floor(num / 100000)) + ' Lakh ';
-    amount = num % 100000;
+    words += toWords(Math.floor(num / 100000)) + 'Lakh ';
+    num = num % 100000;
   }
-
-  // Thousands
   if (num >= 1000) {
-    words += amountToWords(Math.floor(num / 1000)) + ' Thousand ';
-    amount = num % 1000;
+    words += toWords(Math.floor(num / 1000)) + 'Thousand ';
+    num = num % 1000;
+  }
+  if (num > 0) {
+    words += toWords(num);
   }
 
-  // Hundreds
-  if (num >= 100) {
-    words += ones[Math.floor(num / 100)] + ' Hundred ';
-    amount = num % 100;
-  }
-
-  // Tens and Ones
-  if (num >= 20) {
-    words += tens[Math.floor(num / 10)] + ' ';
-    words += ones[num % 10] + ' ';
-  } else if (num >= 10) {
-    words += teens[num - 10] + ' ';
-  } else if (num > 0) {
-    words += ones[num] + ' ';
-  }
-
-  words += 'Rupees';
+  words = words.trim() + ' Rupees';
 
   if (paise > 0) {
-    words += ' and ' + amountToWords(paise) + ' Paise';
+    words += ' and ' + toWords(paise).trim() + ' Paise';
   }
 
   return words.trim() + ' Only';
