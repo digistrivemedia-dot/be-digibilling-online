@@ -4,7 +4,7 @@ import Batch from '../models/Batch.js';
 import { protect } from '../middleware/auth.js';
 import tenantIsolation, { addOrgFilter } from '../middleware/tenantIsolation.js';
 import { requirePermission } from '../middleware/requireSuperAdmin.js';
-import { createBatch } from '../utils/inventoryManager.js';
+import { createBatch, updateProductTotalStock } from '../utils/inventoryManager.js';
 
 const router = express.Router();
 
@@ -323,9 +323,14 @@ router.post('/', requirePermission('canManageProducts'), async (req, res) => {
 // @access  Private (requires permission)
 router.put('/:id', requirePermission('canManageProducts'), async (req, res) => {
   try {
+    // stockQuantity is managed exclusively by inventory operations (invoices, purchases,
+    // stock adjustments). Never allow direct overwrite via product edit — it would
+    // cause the product's stock count to diverge from actual batch quantities.
+    const { stockQuantity, ...safeBody } = req.body;
+
     const product = await Product.findOneAndUpdate(
       addOrgFilter(req, { _id: req.params.id }),
-      req.body,
+      safeBody,
       { new: true, runValidators: true }
     );
 
@@ -355,6 +360,27 @@ router.delete('/:id', requirePermission('canManageProducts'), async (req, res) =
     }
 
     res.json({ message: 'Product deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// @route   POST /api/products/sync-stock
+// @desc    Recompute stockQuantity for all products in this org from actual batch totals.
+//          Use this to fix any data inconsistency caused by direct product edits that
+//          overwrote the computed stock quantity.
+// @access  Private
+router.post('/sync-stock', async (req, res) => {
+  try {
+    const products = await Product.find({ organizationId: req.organizationId, isActive: true });
+    const results = [];
+
+    for (const product of products) {
+      const newQty = await updateProductTotalStock(product._id, req.user._id, req.organizationId);
+      results.push({ name: product.name, stockQuantity: newQty });
+    }
+
+    res.json({ message: `Synced stock for ${results.length} products`, products: results });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }

@@ -1,13 +1,15 @@
 import express from 'express';
 import Batch from '../models/Batch.js';
 import Product from '../models/Product.js';
+import StockAdjustment from '../models/StockAdjustment.js';
 import { protect } from '../middleware/auth.js';
 import { tenantIsolation, addOrgFilter } from '../middleware/tenantIsolation.js';
 import {
   getAvailableBatches,
   getNearExpiryBatches,
   getExpiredBatches,
-  getLowStockProducts
+  getLowStockProducts,
+  updateProductTotalStock
 } from '../utils/inventoryManager.js';
 
 const router = express.Router();
@@ -429,6 +431,135 @@ router.get('/top-selling', async (req, res) => {
     res.json(topSellingProducts);
   } catch (error) {
     console.error('Top selling products error:', error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Direction lookup — used to decide whether to add or subtract from batch quantity
+const TYPE_DIRECTION = {
+  CONSUMED: 'out',
+  PRODUCTION: 'in',
+  MANUAL_ADD: 'in',
+  MANUAL_REMOVE: 'out',
+  DAMAGE: 'out',
+  EXPIRY: 'out',
+  TRANSFER: 'neutral',
+};
+
+// @route   GET /api/inventory/adjustments
+// @desc    Get stock adjustment history for this org
+// @access  Private
+router.get('/adjustments', async (req, res) => {
+  try {
+    const adjustments = await StockAdjustment.find({ organizationId: req.organizationId })
+      .populate('product', 'name unit')
+      .populate('batch', 'batchNo')
+      .sort({ date: -1, createdAt: -1 })
+      .lean();
+    res.json(adjustments);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// @route   POST /api/inventory/adjustments
+// @desc    Record a stock adjustment (updates batch quantity + product total stock)
+// @access  Private
+router.post('/adjustments', async (req, res) => {
+  try {
+    const { productId, batchId, type, quantity, date, reason, notes } = req.body;
+
+    if (!productId) return res.status(400).json({ message: 'productId is required' });
+    if (!type || !TYPE_DIRECTION[type]) return res.status(400).json({ message: 'Invalid adjustment type' });
+    if (!quantity || parseFloat(quantity) <= 0) return res.status(400).json({ message: 'Quantity must be greater than 0' });
+    if (!date) return res.status(400).json({ message: 'Date is required' });
+
+    const product = await Product.findOne({ _id: productId, organizationId: req.organizationId });
+    if (!product) return res.status(404).json({ message: 'Product not found' });
+
+    const direction = TYPE_DIRECTION[type];
+    const qty = parseFloat(quantity);
+    let targetBatch = null;
+
+    if (direction === 'out' || direction === 'neutral') {
+      // Deduct from specific batch or FIFO oldest batch
+      if (batchId) {
+        targetBatch = await Batch.findOne({ _id: batchId, organizationId: req.organizationId, product: productId });
+        if (!targetBatch) return res.status(404).json({ message: 'Batch not found' });
+        if (targetBatch.quantity < qty) {
+          return res.status(400).json({ message: `Insufficient stock in batch. Available: ${targetBatch.quantity}` });
+        }
+        targetBatch.quantity -= qty;
+        await targetBatch.save();
+      } else {
+        // FIFO across all batches
+        const batches = await Batch.find({
+          organizationId: req.organizationId,
+          product: productId,
+          isActive: true,
+          quantity: { $gt: 0 },
+        }).sort({ expiryDate: 1, createdAt: 1 });
+
+        const totalAvailable = batches.reduce((s, b) => s + b.quantity, 0);
+        if (totalAvailable < qty) {
+          return res.status(400).json({ message: `Insufficient total stock. Available: ${totalAvailable}` });
+        }
+
+        let remaining = qty;
+        for (const batch of batches) {
+          if (remaining <= 0) break;
+          const deduct = Math.min(batch.quantity, remaining);
+          batch.quantity -= deduct;
+          remaining -= deduct;
+          await batch.save();
+          if (!targetBatch) targetBatch = batch; // record first batch for the log
+        }
+      }
+    } else {
+      // direction === 'in': add to specific batch or newest active batch
+      if (batchId) {
+        targetBatch = await Batch.findOne({ _id: batchId, organizationId: req.organizationId, product: productId });
+        if (!targetBatch) return res.status(404).json({ message: 'Batch not found' });
+        targetBatch.quantity += qty;
+        await targetBatch.save();
+      } else {
+        // Add to the most recently created active batch
+        targetBatch = await Batch.findOne({
+          organizationId: req.organizationId,
+          product: productId,
+          isActive: true,
+        }).sort({ createdAt: -1 });
+
+        if (!targetBatch) {
+          return res.status(400).json({ message: 'No active batch found for this product. Please add stock via a purchase first.' });
+        }
+        targetBatch.quantity += qty;
+        await targetBatch.save();
+      }
+    }
+
+    // Recompute product total stock from all batches
+    await updateProductTotalStock(productId, req.user._id, req.organizationId);
+
+    // Persist the adjustment record
+    const adjustment = await StockAdjustment.create({
+      organizationId: req.organizationId,
+      userId: req.user._id,
+      product: productId,
+      batch: targetBatch?._id || null,
+      type,
+      direction,
+      quantity: qty,
+      date: new Date(date),
+      reason: reason || '',
+      notes: notes || '',
+    });
+
+    await adjustment.populate('product', 'name unit');
+    await adjustment.populate('batch', 'batchNo');
+
+    res.status(201).json(adjustment);
+  } catch (error) {
     res.status(500).json({ message: error.message });
   }
 });
