@@ -1234,6 +1234,14 @@ router.delete('/:id', async (req, res) => {
       if (item.batch && item.quantity > 0) {
         await addBatchStock(item.batch._id, item.quantity, session);
       }
+      // Un-mark serial number as sold so it can be invoiced again
+      if (item.serialNumber && item.product) {
+        await Product.findByIdAndUpdate(
+          item.product._id || item.product,
+          { $pull: { soldSerialNumbers: item.serialNumber } },
+          { session }
+        );
+      }
     }
 
     // Reverse customer balance
