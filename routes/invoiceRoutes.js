@@ -756,20 +756,29 @@ router.put('/:id', async (req, res) => {
     const inventoryChanges = [];
     const newItemsMap = new Map();
 
-    // Build map of new items by product+batch
+    // Build map of new items by product+batch.
+    // No-batch items (services, non-inventory products) get a positional key so they
+    // are not mistakenly treated as "removed" when the invoice is edited.
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
-      const key = item.batch ? `${item.product}_${item.batch}` : `${item.product}_manual_${i}`;
+      const key = item.batch ? `${item.product}_${item.batch}` : `no_batch_${item.product}_${i}`;
       newItemsMap.set(key, { ...item, index: i });
     }
 
-    // Check which old items were removed or quantity decreased
-    for (const oldItem of oldInvoice.items) {
-      const oldKey = oldItem.batch ? `${oldItem.product._id}_${oldItem.batch._id}` : null;
-      const newItem = oldKey && newItemsMap.get(oldKey);
+    // Check which old tracked items were removed or had their quantity decreased.
+    // Quantity INCREASES are intentionally not registered here — the second loop
+    // (which processes new/modified items) already registers an ADD entry for the
+    // extra quantity, so doing it here too would cause double-deduction.
+    for (let idx = 0; idx < oldInvoice.items.length; idx++) {
+      const oldItem = oldInvoice.items[idx];
+      // Use the same keying scheme as the newItemsMap above
+      const oldKey = oldItem.batch
+        ? `${oldItem.product._id}_${oldItem.batch._id}`
+        : `no_batch_${oldItem.product._id}_${idx}`;
+      const newItem = newItemsMap.get(oldKey);
 
       if (!newItem) {
-        // Item removed - add stock back to original batch
+        // Item removed — return stock to original batch (only for tracked inventory items)
         const returnedQty = oldItem.returnedQuantity || 0;
         const availableToReturn = oldItem.quantity - returnedQty;
 
@@ -786,52 +795,43 @@ router.put('/:id', async (req, res) => {
             returnedQuantity: returnedQty
           });
         }
-      } else {
-        // Item exists in both - check quantity change
+      } else if (oldItem.batch) {
+        // Tracked item still present — handle quantity decrease only.
+        // Increases are handled in the second loop to avoid double-deduction.
         const returnedQty = oldItem.returnedQuantity || 0;
         const oldAvailableQty = oldItem.quantity - returnedQty;
         const requestedQty = newItem.quantity;
 
         if (requestedQty < oldAvailableQty) {
-          // Quantity decreased - return stock
-          const returnQty = oldAvailableQty - requestedQty;
-          if (oldItem.batch) {
-            inventoryChanges.push({
-              type: 'DECREASE',
-              batch: oldItem.batch._id,
-              batchNo: oldItem.batch.batchNo,
-              product: oldItem.product._id,
-              productName: oldItem.productName,
-              oldQuantity: oldItem.quantity,
-              newQuantity: requestedQty,
-              change: returnQty,
-              returnedQuantity: returnedQty
-            });
-          }
-        } else if (requestedQty > oldAvailableQty) {
-          // Quantity increased - need more stock (will handle in new items processing)
+          // Quantity decreased — return the difference to the batch
           inventoryChanges.push({
-            type: 'INCREASE',
-            batch: oldItem.batch?._id,
+            type: 'DECREASE',
+            batch: oldItem.batch._id,
+            batchNo: oldItem.batch.batchNo,
             product: oldItem.product._id,
             productName: oldItem.productName,
             oldQuantity: oldItem.quantity,
             newQuantity: requestedQty,
-            change: requestedQty - oldAvailableQty,
-            needsValidation: true
+            change: oldAvailableQty - requestedQty,
+            returnedQuantity: returnedQty
           });
         }
+        // quantity unchanged or increased → second loop handles it
       }
     }
 
-    // Process new/modified items - validate stock and calculate GST
+    // Process new/modified items — validate stock availability and calculate GST.
+    // For quantity increases on existing items, this loop registers ADD entries.
     const processedItems = [];
     const oldItemsMap = new Map();
 
-    // Build map of old items
-    for (const oldItem of oldInvoice.items) {
-      const key = oldItem.batch ? `${oldItem.product._id}_${oldItem.batch._id}` : null;
-      if (key) oldItemsMap.set(key, oldItem);
+    // Build map of old items (tracked inventory items only, keyed by product+batch)
+    for (let idx = 0; idx < oldInvoice.items.length; idx++) {
+      const oldItem = oldInvoice.items[idx];
+      const key = oldItem.batch
+        ? `${oldItem.product._id}_${oldItem.batch._id}`
+        : `no_batch_${oldItem.product._id}_${idx}`;
+      oldItemsMap.set(key, oldItem);
     }
 
     for (let i = 0; i < items.length; i++) {
@@ -848,8 +848,10 @@ router.put('/:id', async (req, res) => {
         return res.status(400).json({ message: `Invalid quantity for item #${i + 1} (${product.name})` });
       }
 
-      const itemKey = item.batch ? `${item.product}_${item.batch}` : null;
-      const oldItem = itemKey && oldItemsMap.get(itemKey);
+      const itemKey = item.batch
+        ? `${item.product}_${item.batch}`
+        : `no_batch_${item.product}_${i}`;
+      const oldItem = oldItemsMap.get(itemKey);
 
       if (!oldItem) {
         // NEW ITEM - Use FIFO batch selection (like invoice creation)
