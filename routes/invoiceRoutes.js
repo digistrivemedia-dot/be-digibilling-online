@@ -393,6 +393,26 @@ router.post('/', async (req, res) => {
       }
 
       // ── Inventory-tracked product: normal stock / batch logic ───────────
+
+      // Serial number products: require a serial to be selected and verify it is available
+      if (product.serialNumbers && product.serialNumbers.length > 0) {
+        if (!item.serialNumber) {
+          return res.status(400).json({
+            message: `Serial number is required for ${product.name}`
+          });
+        }
+        if (!product.serialNumbers.includes(item.serialNumber)) {
+          return res.status(400).json({
+            message: `Serial number "${item.serialNumber}" does not belong to ${product.name}`
+          });
+        }
+        if ((product.soldSerialNumbers || []).includes(item.serialNumber)) {
+          return res.status(400).json({
+            message: `Serial number "${item.serialNumber}" has already been sold`
+          });
+        }
+      }
+
       // Check total available stock
       if (product.stockQuantity < item.quantity) {
         throw new Error(`Insufficient stock for ${product.name}. Available: ${product.stockQuantity}, Requested: ${item.quantity}`);
