@@ -226,11 +226,11 @@ router.put('/batches/:id/toggle-active', async (req, res) => {
     }
 
     // Toggle isActive status
-    batch.isActive = !batch.isActive;
-    await batch.save();
+    const newIsActive = !batch.isActive;
+    await Batch.findByIdAndUpdate(batch._id, { $set: { isActive: newIsActive } });
+    batch.isActive = newIsActive; // keep local copy consistent for response
 
     // Update product total stock (will exclude inactive batches)
-    const { updateProductTotalStock } = await import('../utils/inventoryManager.js');
     await updateProductTotalStock(batch.product, batch.userId, batch.organizationId);
 
     res.json({
@@ -258,14 +258,13 @@ router.put('/batches/:id', async (req, res) => {
 
     // Only allow updating certain fields
     const allowedUpdates = ['sellingPrice', 'mrp', 'rack'];
+    const updateFields = {};
     allowedUpdates.forEach(field => {
-      if (req.body[field] !== undefined) {
-        batch[field] = req.body[field];
-      }
+      if (req.body[field] !== undefined) updateFields[field] = req.body[field];
     });
 
-    await batch.save();
-    res.json(batch);
+    const updatedBatch = await Batch.findByIdAndUpdate(batch._id, { $set: updateFields }, { new: true });
+    res.json(updatedBatch);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -327,7 +326,6 @@ router.delete('/batches/:id', async (req, res) => {
       });
     } else {
       // Update product total stock (excluding deleted batch)
-      const { updateProductTotalStock } = await import('../utils/inventoryManager.js');
       await updateProductTotalStock(productId, userId, organizationId);
 
       return res.json({
@@ -489,8 +487,11 @@ router.post('/adjustments', async (req, res) => {
         if (targetBatch.quantity < qty) {
           return res.status(400).json({ message: `Insufficient stock in batch. Available: ${targetBatch.quantity}` });
         }
-        targetBatch.quantity -= qty;
-        await targetBatch.save();
+        const newQty = targetBatch.quantity - qty;
+        const batchUpdate = { quantity: newQty };
+        if (newQty <= 0) { batchUpdate.isActive = false; batchUpdate.depletedAt = new Date(); }
+        await Batch.findByIdAndUpdate(targetBatch._id, { $set: batchUpdate });
+        await Product.findByIdAndUpdate(productId, { $inc: { stockQuantity: -qty } });
       } else {
         // FIFO across all batches
         const batches = await Batch.find({
@@ -506,22 +507,28 @@ router.post('/adjustments', async (req, res) => {
         }
 
         let remaining = qty;
+        let totalDeducted = 0;
         for (const batch of batches) {
           if (remaining <= 0) break;
           const deduct = Math.min(batch.quantity, remaining);
-          batch.quantity -= deduct;
+          const newQty = batch.quantity - deduct;
+          const batchUpdate = { quantity: newQty };
+          if (newQty <= 0) { batchUpdate.isActive = false; batchUpdate.depletedAt = new Date(); }
+          await Batch.findByIdAndUpdate(batch._id, { $set: batchUpdate });
           remaining -= deduct;
-          await batch.save();
+          totalDeducted += deduct;
           if (!targetBatch) targetBatch = batch; // record first batch for the log
         }
+        await Product.findByIdAndUpdate(productId, { $inc: { stockQuantity: -totalDeducted } });
       }
     } else {
       // direction === 'in': add to specific batch or newest active batch
       if (batchId) {
         targetBatch = await Batch.findOne({ _id: batchId, organizationId: req.organizationId, product: productId });
         if (!targetBatch) return res.status(404).json({ message: 'Batch not found' });
-        targetBatch.quantity += qty;
-        await targetBatch.save();
+        const newQty = targetBatch.quantity + qty;
+        await Batch.findByIdAndUpdate(targetBatch._id, { $set: { quantity: newQty, isActive: true, depletedAt: null } });
+        await Product.findByIdAndUpdate(productId, { $inc: { stockQuantity: qty } });
       } else {
         // Add to the most recently created active batch
         targetBatch = await Batch.findOne({
@@ -533,13 +540,11 @@ router.post('/adjustments', async (req, res) => {
         if (!targetBatch) {
           return res.status(400).json({ message: 'No active batch found for this product. Please add stock via a purchase first.' });
         }
-        targetBatch.quantity += qty;
-        await targetBatch.save();
+        const newQty = targetBatch.quantity + qty;
+        await Batch.findByIdAndUpdate(targetBatch._id, { $set: { quantity: newQty } });
+        await Product.findByIdAndUpdate(productId, { $inc: { stockQuantity: qty } });
       }
     }
-
-    // Recompute product total stock from all batches
-    await updateProductTotalStock(productId, req.user._id, req.organizationId);
 
     // Persist the adjustment record
     const adjustment = await StockAdjustment.create({
