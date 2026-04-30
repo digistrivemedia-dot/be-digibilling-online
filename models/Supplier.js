@@ -101,6 +101,12 @@ const supplierSchema = new mongoose.Schema({
   timestamps: true
 });
 
+// Virtual alias so Supplier and Customer share the same public field name.
+// Internally stored as `currentBalance` to avoid a DB migration.
+supplierSchema.virtual('outstandingBalance')
+  .get(function () { return this.currentBalance; })
+  .set(function (v) { this.currentBalance = v; });
+
 // Indexes for multi-tenant queries
 supplierSchema.index({ organizationId: 1, name: 1 });
 supplierSchema.index({ organizationId: 1, isActive: 1 });

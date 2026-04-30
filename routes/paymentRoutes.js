@@ -208,15 +208,11 @@ router.post('/', async (req, res) => {
       referenceNumber
     }], { session });
 
-    // Update party balance — clamp at 0 to match original behaviour (never go negative)
+    // Update party balance — allow negative (negative = credit balance owed to party)
     if (type === 'RECEIVED' && partyType === 'CUSTOMER') {
-      await Customer.findByIdAndUpdate(partyId, [
-        { $set: { outstandingBalance: { $max: [0, { $subtract: ['$outstandingBalance', amount] }] } } }
-      ], { session });
+      await Customer.findByIdAndUpdate(partyId, { $inc: { outstandingBalance: -amount } }, { session });
     } else if (type === 'PAID' && partyType === 'SUPPLIER') {
-      await Supplier.findByIdAndUpdate(partyId, [
-        { $set: { currentBalance: { $max: [0, { $subtract: ['$currentBalance', amount] }] } } }
-      ], { session });
+      await Supplier.findByIdAndUpdate(partyId, { $inc: { currentBalance: -amount } }, { session });
     }
 
     // Update referenced invoice/purchase payment status

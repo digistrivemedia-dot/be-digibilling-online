@@ -464,6 +464,7 @@ router.get('/adjustments', async (req, res) => {
 // @desc    Record a stock adjustment (updates batch quantity + product total stock)
 // @access  Private
 router.post('/adjustments', async (req, res) => {
+  let session = null;
   try {
     const { productId, batchId, type, quantity, date, reason, notes } = req.body;
 
@@ -472,39 +473,57 @@ router.post('/adjustments', async (req, res) => {
     if (!quantity || parseFloat(quantity) <= 0) return res.status(400).json({ message: 'Quantity must be greater than 0' });
     if (!date) return res.status(400).json({ message: 'Date is required' });
 
+    // ── Pre-validate before transaction ──────────────────────────────────────
     const product = await Product.findOne({ _id: productId, organizationId: req.organizationId });
     if (!product) return res.status(404).json({ message: 'Product not found' });
 
     const direction = TYPE_DIRECTION[type];
     const qty = parseFloat(quantity);
-    let targetBatch = null;
 
+    // Validate stock availability before starting transaction
     if (direction === 'out' || direction === 'neutral') {
-      // Deduct from specific batch or FIFO oldest batch
       if (batchId) {
-        targetBatch = await Batch.findOne({ _id: batchId, organizationId: req.organizationId, product: productId });
+        const targetBatch = await Batch.findOne({ _id: batchId, organizationId: req.organizationId, product: productId });
         if (!targetBatch) return res.status(404).json({ message: 'Batch not found' });
         if (targetBatch.quantity < qty) {
           return res.status(400).json({ message: `Insufficient stock in batch. Available: ${targetBatch.quantity}` });
         }
+      } else {
+        const batches = await Batch.find({ organizationId: req.organizationId, product: productId, isActive: true, quantity: { $gt: 0 } });
+        const totalAvailable = batches.reduce((s, b) => s + b.quantity, 0);
+        if (totalAvailable < qty) {
+          return res.status(400).json({ message: `Insufficient total stock. Available: ${totalAvailable}` });
+        }
+      }
+    } else if (!batchId) {
+      const activeBatch = await Batch.findOne({ organizationId: req.organizationId, product: productId, isActive: true });
+      if (!activeBatch) {
+        return res.status(400).json({ message: 'No active batch found for this product. Please add stock via a purchase first.' });
+      }
+    }
+
+    // ── START TRANSACTION ─────────────────────────────────────────────────────
+    session = await Batch.startSession();
+    session.startTransaction();
+
+    let targetBatch = null;
+
+    if (direction === 'out' || direction === 'neutral') {
+      if (batchId) {
+        targetBatch = await Batch.findOne({ _id: batchId, organizationId: req.organizationId, product: productId }).session(session);
         const newQty = targetBatch.quantity - qty;
         const batchUpdate = { quantity: newQty };
         if (newQty <= 0) { batchUpdate.isActive = false; batchUpdate.depletedAt = new Date(); }
-        await Batch.findByIdAndUpdate(targetBatch._id, { $set: batchUpdate });
-        await Product.findByIdAndUpdate(productId, { $inc: { stockQuantity: -qty } });
+        await Batch.findByIdAndUpdate(targetBatch._id, { $set: batchUpdate }, { session });
+        await Product.findByIdAndUpdate(productId, { $inc: { stockQuantity: -qty } }, { session });
       } else {
-        // FIFO across all batches
+        // FIFO across all batches (within transaction)
         const batches = await Batch.find({
           organizationId: req.organizationId,
           product: productId,
           isActive: true,
           quantity: { $gt: 0 },
-        }).sort({ expiryDate: 1, createdAt: 1 });
-
-        const totalAvailable = batches.reduce((s, b) => s + b.quantity, 0);
-        if (totalAvailable < qty) {
-          return res.status(400).json({ message: `Insufficient total stock. Available: ${totalAvailable}` });
-        }
+        }).session(session).sort({ expiryDate: 1, createdAt: 1 });
 
         let remaining = qty;
         let totalDeducted = 0;
@@ -514,40 +533,35 @@ router.post('/adjustments', async (req, res) => {
           const newQty = batch.quantity - deduct;
           const batchUpdate = { quantity: newQty };
           if (newQty <= 0) { batchUpdate.isActive = false; batchUpdate.depletedAt = new Date(); }
-          await Batch.findByIdAndUpdate(batch._id, { $set: batchUpdate });
+          await Batch.findByIdAndUpdate(batch._id, { $set: batchUpdate }, { session });
           remaining -= deduct;
           totalDeducted += deduct;
           if (!targetBatch) targetBatch = batch; // record first batch for the log
         }
-        await Product.findByIdAndUpdate(productId, { $inc: { stockQuantity: -totalDeducted } });
+        await Product.findByIdAndUpdate(productId, { $inc: { stockQuantity: -totalDeducted } }, { session });
       }
     } else {
       // direction === 'in': add to specific batch or newest active batch
       if (batchId) {
-        targetBatch = await Batch.findOne({ _id: batchId, organizationId: req.organizationId, product: productId });
-        if (!targetBatch) return res.status(404).json({ message: 'Batch not found' });
+        targetBatch = await Batch.findOne({ _id: batchId, organizationId: req.organizationId, product: productId }).session(session);
         const newQty = targetBatch.quantity + qty;
-        await Batch.findByIdAndUpdate(targetBatch._id, { $set: { quantity: newQty, isActive: true, depletedAt: null } });
-        await Product.findByIdAndUpdate(productId, { $inc: { stockQuantity: qty } });
+        await Batch.findByIdAndUpdate(targetBatch._id, { $set: { quantity: newQty, isActive: true, depletedAt: null } }, { session });
+        await Product.findByIdAndUpdate(productId, { $inc: { stockQuantity: qty } }, { session });
       } else {
-        // Add to the most recently created active batch
         targetBatch = await Batch.findOne({
           organizationId: req.organizationId,
           product: productId,
           isActive: true,
-        }).sort({ createdAt: -1 });
+        }).session(session).sort({ createdAt: -1 });
 
-        if (!targetBatch) {
-          return res.status(400).json({ message: 'No active batch found for this product. Please add stock via a purchase first.' });
-        }
         const newQty = targetBatch.quantity + qty;
-        await Batch.findByIdAndUpdate(targetBatch._id, { $set: { quantity: newQty } });
-        await Product.findByIdAndUpdate(productId, { $inc: { stockQuantity: qty } });
+        await Batch.findByIdAndUpdate(targetBatch._id, { $set: { quantity: newQty } }, { session });
+        await Product.findByIdAndUpdate(productId, { $inc: { stockQuantity: qty } }, { session });
       }
     }
 
     // Persist the adjustment record
-    const adjustment = await StockAdjustment.create({
+    const [adjustment] = await StockAdjustment.create([{
       organizationId: req.organizationId,
       userId: req.user._id,
       product: productId,
@@ -558,14 +572,20 @@ router.post('/adjustments', async (req, res) => {
       date: new Date(date),
       reason: reason || '',
       notes: notes || '',
-    });
+    }], { session });
 
+    await session.commitTransaction();
+
+    // Populate after commit (no session needed)
     await adjustment.populate('product', 'name unit');
     await adjustment.populate('batch', 'batchNo');
 
     res.status(201).json(adjustment);
   } catch (error) {
+    if (session) await session.abortTransaction();
     res.status(500).json({ message: error.message });
+  } finally {
+    if (session) session.endSession();
   }
 });
 
