@@ -90,16 +90,20 @@ router.put('/:id', requirePermission('canManageCustomers'), async (req, res) => 
 // @access  Private (requires permission)
 router.delete('/:id', requirePermission('canManageCustomers'), async (req, res) => {
   try {
-    const customer = await Customer.findOneAndUpdate(
-      addOrgFilter(req, { _id: req.params.id }),
-      { isActive: false },
-      { new: true }
-    );
+    const customer = await Customer.findOne(addOrgFilter(req, { _id: req.params.id }));
 
     if (!customer) {
       return res.status(404).json({ message: 'Customer not found' });
     }
 
+    // BUG-002: Block deletion if customer has an outstanding balance
+    if ((customer.outstandingBalance || 0) > 0) {
+      return res.status(400).json({
+        message: `Cannot delete customer "${customer.name}" — they have an outstanding balance of ₹${customer.outstandingBalance.toFixed(2)}. Clear dues first.`
+      });
+    }
+
+    await Customer.findByIdAndUpdate(customer._id, { isActive: false });
     res.json({ message: 'Customer deleted successfully' });
   } catch (error) {
     res.status(500).json({ message: error.message });

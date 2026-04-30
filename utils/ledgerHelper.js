@@ -351,7 +351,7 @@ export const postExpenseToLedger = async (expense, userId, organizationId) => {
  * @param {String} organizationId
  * @returns {Array} - Created ledger entries
  */
-export const postPaymentToLedger = async (payment, userId, organizationId) => {
+export const postPaymentToLedger = async (payment, userId, organizationId, session = null) => {
   const entries = [];
   const fy = getFinancialYear(payment.date);
 
@@ -413,7 +413,7 @@ export const postPaymentToLedger = async (payment, userId, organizationId) => {
     description: `Payment Entry - ${payment.paymentNumber}`,
     date: payment.date,
     financialYear: fy
-  });
+  }, session);
 };
 
 /**
@@ -423,7 +423,7 @@ export const postPaymentToLedger = async (payment, userId, organizationId) => {
  * @param {String} organizationId
  * @returns {Array} - Created ledger entries
  */
-export const postPurchaseReturnToLedger = async (purchaseReturn, userId, organizationId) => {
+export const postPurchaseReturnToLedger = async (purchaseReturn, userId, organizationId, session = null) => {
   const entries = [];
   const fy = getFinancialYear(purchaseReturn.returnDate);
 
@@ -495,7 +495,7 @@ export const postPurchaseReturnToLedger = async (purchaseReturn, userId, organiz
     description: `Purchase Return - ${purchaseReturn.debitNoteNumber}`,
     date: purchaseReturn.returnDate,
     financialYear: fy
-  });
+  }, session);
 };
 
 /**
@@ -504,7 +504,7 @@ export const postPurchaseReturnToLedger = async (purchaseReturn, userId, organiz
  * @param {String} userId
  * @returns {Array} - Created ledger entries
  */
-export const postSalesReturnToLedger = async (salesReturn, userId, organizationId) => {
+export const postSalesReturnToLedger = async (salesReturn, userId, organizationId, session = null) => {
   const entries = [];
   const fy = getFinancialYear(salesReturn.returnDate);
 
@@ -590,7 +590,7 @@ export const postSalesReturnToLedger = async (salesReturn, userId, organizationI
     description: `Sales Return - ${salesReturn.creditNoteNumber}`,
     date: salesReturn.returnDate,
     financialYear: fy
-  });
+  }, session);
 };
 
 /**

@@ -131,94 +131,98 @@ router.get('/:id', async (req, res) => {
   }
 });
 
+// Valid reason codes (must match SalesReturn model enum)
+const VALID_SALES_RETURN_REASONS = ['DAMAGED', 'EXPIRED', 'WRONG_ITEM', 'NOT_NEEDED', 'SIDE_EFFECTS', 'OTHER'];
+
 // @route   POST /api/sales-returns
 // @desc    Create sales return (Credit Note)
 // @access  Private
 router.post('/', async (req, res) => {
+  let session = null;
   try {
     const { originalInvoice: invoiceId, items, reason, reasonDescription, refundMethod } = req.body;
+    const orgId = req.organizationId || req.user.organizationId;
+
+    // BUG-009: Validate reason before any DB writes
+    if (!reason || !VALID_SALES_RETURN_REASONS.includes(reason)) {
+      return res.status(400).json({
+        message: `Invalid return reason. Must be one of: ${VALID_SALES_RETURN_REASONS.join(', ')}`
+      });
+    }
 
     // Validate original invoice
     const invoice = await Invoice.findOne(addOrgFilter(req, { _id: invoiceId }))
       .populate('customer');
-
     if (!invoice) {
       return res.status(404).json({ message: 'Original invoice not found' });
     }
 
-    // Process return items
-    const processedItems = [];
+    // ── Pre-validate items and determine restock eligibility (no DB writes yet) ─
+    const validatedItems = [];
     for (const item of items) {
-      // Find original invoice item
-      // For old invoices without batch tracking, match by product
-      // For new invoices with batch tracking, match by batch
       let originalItem;
       if (item.batch) {
-        // New invoice - match by batch
-        originalItem = invoice.items.find(
-          ii => ii.batch && ii.batch.toString() === item.batch.toString()
-        );
+        originalItem = invoice.items.find(ii => ii.batch && ii.batch.toString() === item.batch.toString());
       } else {
-        // Old invoice - match by product (and ensure not already fully returned)
         originalItem = invoice.items.find(
-          ii => ii.product.toString() === item.product.toString() &&
-            (ii.returnedQuantity || 0) < ii.quantity
+          ii => ii.product.toString() === item.product.toString() && (ii.returnedQuantity || 0) < ii.quantity
         );
       }
-
       if (!originalItem) {
-        throw new Error('Item not found in original invoice');
+        return res.status(400).json({ message: 'Item not found in original invoice' });
       }
 
-      // Validate return quantity
       const alreadyReturned = originalItem.returnedQuantity || 0;
       if (item.quantity > (originalItem.quantity - alreadyReturned)) {
-        throw new Error(`Cannot return more than sold quantity for item`);
+        return res.status(400).json({ message: `Cannot return more than sold quantity for item` });
       }
 
-      // Calculate GST for return item (use 'invoice' context for sales returns)
       const itemWithGST = calculateItemGST({
         ...item,
         sellingPrice: originalItem.sellingPrice,
         gstRate: originalItem.gstRate
       }, invoice.taxType, 'invoice');
 
-      // Only restock if batch exists and can be restocked
+      // Determine restock eligibility — check now, apply inside transaction
       let canRestock = false;
-      let restocked = false;
       if (item.batch) {
         canRestock = await canRestockBatch(item.batch);
-        if (canRestock && reason !== 'EXPIRED' && reason !== 'DAMAGED') {
-          // Add back to batch inventory
-          await addBatchStock(item.batch, item.quantity);
-          restocked = true;
-        }
       }
+      const shouldRestock = canRestock && reason !== 'EXPIRED' && reason !== 'DAMAGED';
 
-      processedItems.push({
-        ...itemWithGST,
-        product: originalItem.product,
-        productName: originalItem.productName,
-        batch: item.batch || null,
-        batchNo: originalItem.batchNo || item.batchNo,
-        expiryDate: originalItem.expiryDate,
-        hsnCode: originalItem.hsnCode,
-        unit: originalItem.unit,
-        canRestock,
-        restocked
-      });
-
-      // Update original invoice item returned quantity
-      originalItem.returnedQuantity = alreadyReturned + item.quantity;
+      validatedItems.push({ item, itemWithGST, originalItem, alreadyReturned, canRestock, shouldRestock });
     }
 
-    // Calculate totals
+    const processedItems = validatedItems.map(({ item, itemWithGST, originalItem, canRestock, shouldRestock }) => ({
+      ...itemWithGST,
+      product: originalItem.product,
+      productName: originalItem.productName,
+      batch: item.batch || null,
+      batchNo: originalItem.batchNo || item.batchNo,
+      expiryDate: originalItem.expiryDate,
+      hsnCode: originalItem.hsnCode,
+      unit: originalItem.unit,
+      canRestock,
+      restocked: shouldRestock
+    }));
+
     const totals = calculateTotals(processedItems, {}, 0);
 
-    // Create sales return
-    const salesReturn = await SalesReturn.create({
+    // ── START TRANSACTION ─────────────────────────────────────────────────────
+    session = await SalesReturn.startSession();
+    session.startTransaction();
+
+    // Restock eligible batches
+    for (const { item, shouldRestock } of validatedItems) {
+      if (shouldRestock && item.batch) {
+        await addBatchStock(item.batch, item.quantity, session);
+      }
+    }
+
+    // Create sales return document
+    const salesReturn = new SalesReturn({
       userId: req.user._id,
-      organizationId: req.organizationId || req.user.organizationId,
+      organizationId: orgId,
       customer: invoice.customer?._id,
       customerName: invoice.customerName,
       customerPhone: invoice.customerPhone,
@@ -234,36 +238,38 @@ router.post('/', async (req, res) => {
       taxType: invoice.taxType,
       ...totals
     });
+    await salesReturn.save({ session });
 
-    // Update original invoice
-    const allItemsFullyReturned = invoice.items.every(item => {
-      const returned = item.returnedQuantity || 0;
-      return returned >= item.quantity;
-    });
-
+    // Update original invoice returned quantities and flags
+    for (const { originalItem, item, alreadyReturned } of validatedItems) {
+      originalItem.returnedQuantity = alreadyReturned + item.quantity;
+    }
+    const allItemsFullyReturned = invoice.items.every(ii => (ii.returnedQuantity || 0) >= ii.quantity);
     invoice.isReturned = allItemsFullyReturned;
-    invoice.partiallyReturned = !allItemsFullyReturned && invoice.items.some(item => (item.returnedQuantity || 0) > 0);
+    invoice.partiallyReturned = !allItemsFullyReturned && invoice.items.some(ii => (ii.returnedQuantity || 0) > 0);
     invoice.returnedAmount += totals.grandTotal;
-    await invoice.save();
+    await invoice.save({ session });
 
-    // Update customer balance if exists
-    if (invoice.customer) {
-      const customer = await Customer.findById(invoice.customer);
-      if (customer) {
-        customer.outstandingBalance -= totals.grandTotal;
-        await customer.save();
-      }
+    // Update customer balance
+    if (invoice.customer?._id) {
+      await Customer.findByIdAndUpdate(invoice.customer._id, {
+        $inc: { outstandingBalance: -totals.grandTotal }
+      }, { session });
     }
 
     // Post to ledger
-    const ledgerEntries = await postSalesReturnToLedger(salesReturn, req.user._id, req.organizationId || req.user.organizationId);
+    const ledgerEntries = await postSalesReturnToLedger(salesReturn, req.user._id, orgId, session);
     salesReturn.ledgerEntries = ledgerEntries.map(entry => entry._id);
-    await salesReturn.save();
+    await salesReturn.save({ session });
 
+    await session.commitTransaction();
     res.status(201).json(salesReturn);
   } catch (error) {
+    if (session) await session.abortTransaction();
     console.error('Sales return error:', error);
     res.status(500).json({ message: error.message });
+  } finally {
+    if (session) session.endSession();
   }
 });
 

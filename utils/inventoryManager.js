@@ -146,15 +146,18 @@ export const addBatchStock = async (batchId, quantity, session = null) => {
  * @param {Object} batchData
  * @returns {Object} - Created batch
  */
-export const createBatch = async (batchData) => {
-  const batch = await Batch.create(batchData);
+export const createBatch = async (batchData, session = null) => {
+  // Use array form of Model.create() so the session is respected by Mongoose
+  const createOpts = session ? { session } : {};
+  const [batch] = await Batch.create([batchData], createOpts);
 
   // Use $inc instead of updateProductTotalStock to avoid a re-query of all batches.
   // Re-querying immediately after Batch.create() can miss the new batch on some
   // MongoDB configurations, resulting in stockQuantity staying at 0.
+  const updateOpts = session ? { session } : {};
   await Product.findByIdAndUpdate(batch.product, {
     $inc: { stockQuantity: batchData.quantity || 0 }
-  });
+  }, updateOpts);
 
   return batch;
 };
@@ -294,9 +297,11 @@ export const getBatchDetails = async (batchId) => {
  * @param {String} purchaseId
  * @returns {Object} - Batch object
  */
-export const findOrCreateBatchForPurchase = async (purchaseItem, userId, organizationId, supplierId, purchaseId) => {
+export const findOrCreateBatchForPurchase = async (purchaseItem, userId, organizationId, supplierId, purchaseId, session = null) => {
   // Build query conditionally - only match existing batch if batchNo is provided
   let batch = null;
+  const queryOpts = session ? { session } : {};
+  const updateOpts = session ? { session } : {};
 
   if (purchaseItem.batchNo) {
     // Match existing batch by batchNo + product only (not by userId).
@@ -307,14 +312,14 @@ export const findOrCreateBatchForPurchase = async (purchaseItem, userId, organiz
       product: purchaseItem.product,
       batchNo: purchaseItem.batchNo,
       expiryDate: purchaseItem.expiryDate
-    });
+    }, null, queryOpts);
   }
 
   if (batch) {
     // Add to existing batch using $inc (avoids __v conflict and re-query issue)
     const addQty = purchaseItem.quantity + (purchaseItem.freeQuantity || 0);
-    await Batch.findByIdAndUpdate(batch._id, { $inc: { quantity: addQty } });
-    await Product.findByIdAndUpdate(batch.product, { $inc: { stockQuantity: addQty } });
+    await Batch.findByIdAndUpdate(batch._id, { $inc: { quantity: addQty } }, updateOpts);
+    await Product.findByIdAndUpdate(batch.product, { $inc: { stockQuantity: addQty } }, updateOpts);
     batch.quantity += addQty; // keep local copy consistent for return value
   } else {
     // Create new batch - auto-generate batch number if not provided
@@ -340,7 +345,7 @@ export const findOrCreateBatchForPurchase = async (purchaseItem, userId, organiz
       purchaseInvoice: purchaseId,
       supplier: supplierId,
       rack: purchaseItem.rack || ''
-    });
+    }, session);
   }
 
   return batch;

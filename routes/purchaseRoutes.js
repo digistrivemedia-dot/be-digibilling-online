@@ -151,69 +151,80 @@ router.get('/:id', async (req, res) => {
 // @desc    Create purchase entry
 // @access  Private
 router.post('/', async (req, res) => {
+  let session = null;
   try {
     const { supplier: supplierId, items, ...purchaseData } = req.body;
+    const orgId = req.organizationId || req.user.organizationId;
 
-    // Validate supplier
+    // ── Validate supplier ──────────────────────────────────────────────────────
     if (!supplierId || supplierId === '') {
       return res.status(400).json({ message: 'Please select a supplier' });
     }
-
     const supplier = await Supplier.findOne(addOrgFilter(req, { _id: supplierId }));
-
     if (!supplier) {
       return res.status(404).json({ message: 'Supplier not found' });
     }
 
-    // Validate items array
+    // ── Validate items ────────────────────────────────────────────────────────
     if (!items || items.length === 0) {
       return res.status(400).json({ message: 'Please add at least one item to the purchase' });
     }
 
-    // Get shop settings for tax type determination
+    // ── Pre-validate all items and compute GST (no DB writes yet) ────────────
     const shopSettings = await ShopSettings.findOne(addOrgFilter(req));
     const taxType = determineTaxType(shopSettings?.state, supplier.state);
 
-    // Process each item
-    const processedItems = [];
+    const itemsWithGST = [];
+    const zeroPriceWarnings = [];
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
-
-      // Validate product is selected
       if (!item.product || item.product === '') {
         return res.status(400).json({ message: `Please select a product for item #${i + 1}` });
       }
-
-      // Validate quantity
       if (!item.quantity || item.quantity <= 0) {
         return res.status(400).json({ message: `Please enter a valid quantity for item #${i + 1}` });
       }
-
-      // Validate product exists
       const product = await Product.findOne(addOrgFilter(req, { _id: item.product }));
-
       if (!product) {
         return res.status(400).json({ message: `Product not found for item #${i + 1}. Please select a valid product.` });
       }
+      // BUG-018: Warn if purchasePrice is 0 (COGS will be 0, P&L profit may be overstated)
+      if (!item.purchasePrice || item.purchasePrice <= 0) {
+        zeroPriceWarnings.push(`Item #${i + 1} (${product.name}): purchase price is 0 — COGS will not be tracked for this item.`);
+      }
+      const itemWithGST = calculateItemGST({ ...item, purchasePrice: item.purchasePrice }, taxType, 'purchase');
+      itemsWithGST.push({ item, itemWithGST, product });
+    }
 
-      // Calculate GST for item (pass 'purchase' context to use purchase price)
-      const itemWithGST = calculateItemGST({
-        ...item,
-        purchasePrice: item.purchasePrice
-      }, taxType, 'purchase');
+    // ── Calculate totals ───────────────────────────────────────────────────────
+    const preProcessed = itemsWithGST.map(({ itemWithGST }) => itemWithGST);
+    const totals = calculateTotals(preProcessed, {
+      freight: purchaseData.freight || 0,
+      packaging: purchaseData.packaging || 0,
+      otherCharges: purchaseData.otherCharges || 0
+    }, purchaseData.discount || 0);
 
-      // Create or update batch
+    const paidAmount = purchaseData.paidAmount || 0;
+    const balanceAmount = totals.grandTotal - paidAmount;
+    const paymentStatus = balanceAmount <= 0 ? 'PAID' : (paidAmount > 0 ? 'PARTIAL' : 'UNPAID');
+
+    // ── START TRANSACTION — all DB writes below are atomic ───────────────────
+    session = await Purchase.startSession();
+    session.startTransaction();
+
+    const Batch = (await import('../models/Batch.js')).default;
+
+    // Create/update batches inside transaction
+    const processedItems = [];
+    for (const { item, itemWithGST, product } of itemsWithGST) {
       const batch = await findOrCreateBatchForPurchase(
-        {
-          ...item,
-          ...itemWithGST
-        },
+        { ...item, ...itemWithGST },
         req.user._id,
-        req.organizationId || req.user.organizationId,
+        orgId,
         supplierId,
-        null // Purchase ID will be updated later
+        null, // purchaseId set after Purchase.create
+        session
       );
-
       processedItems.push({
         ...itemWithGST,
         product: product._id,
@@ -226,26 +237,10 @@ router.post('/', async (req, res) => {
       });
     }
 
-    // Calculate totals
-    const totals = calculateTotals(
-      processedItems,
-      {
-        freight: purchaseData.freight || 0,
-        packaging: purchaseData.packaging || 0,
-        otherCharges: purchaseData.otherCharges || 0
-      },
-      purchaseData.discount || 0
-    );
-
-    // Calculate balance amount
-    const paidAmount = purchaseData.paidAmount || 0;
-    const balanceAmount = totals.grandTotal - paidAmount;
-    const paymentStatus = balanceAmount <= 0 ? 'PAID' : (paidAmount > 0 ? 'PARTIAL' : 'UNPAID');
-
-    // Create purchase
-    const purchase = await Purchase.create({
+    // Create purchase document
+    const purchase = new Purchase({
       userId: req.user._id,
-      organizationId: req.organizationId || req.user.organizationId,
+      organizationId: orgId,
       supplier: supplier._id,
       supplierName: supplier.name,
       supplierGstin: supplier.gstin,
@@ -267,60 +262,50 @@ router.post('/', async (req, res) => {
       paidAmount,
       balanceAmount
     });
+    await purchase.save({ session });
 
-    // Update batch references with purchase ID
+    // Link batches back to this purchase
     for (const item of processedItems) {
-      const Batch = (await import('../models/Batch.js')).default;
-      await Batch.findByIdAndUpdate(item.batch, {
-        purchaseInvoice: purchase._id
-      });
+      await Batch.findByIdAndUpdate(item.batch, { purchaseInvoice: purchase._id }, { session });
     }
 
     // Update supplier totals
-    supplier.currentBalance += balanceAmount;
-    supplier.totalPurchases += totals.grandTotal;
-    await supplier.save();
+    await Supplier.findByIdAndUpdate(supplier._id, {
+      $inc: { currentBalance: balanceAmount, totalPurchases: totals.grandTotal }
+    }, { session });
 
-    // Post to ledger (double entry accounting)
-    const ledgerEntries = await postPurchaseToLedger(purchase, req.user._id, req.organizationId || req.user.organizationId);
+    // Post to ledger
+    const ledgerEntries = await postPurchaseToLedger(purchase, req.user._id, orgId, session);
     purchase.ledgerEntries = ledgerEntries.map(entry => entry._id);
 
-    // If initial payment was made during purchase creation, create payment entry with ledger
+    // Initial payment ledger entries
     if (paidAmount > 0) {
       const Ledger = (await import('../models/Ledger.js')).default;
-
-      // Create ledger entries for the initial payment
-      const paymentLedgerEntries = await Ledger.createDoubleEntry(
-        req.organizationId || req.user.organizationId,
-        req.user._id,
-        [
-          {
-            account: 'ACCOUNTS_PAYABLE',
-            type: 'DEBIT',
-            amount: paidAmount,
-            party: 'SUPPLIER',
-            partyId: supplier._id,
-            partyModel: 'Supplier',
-            partyName: supplier.name,
-            description: `Initial payment for ${purchase.purchaseNumber}`
-          },
-          {
-            account: purchaseData.paymentMethod === 'CASH' ? 'CASH' : 'BANK',
-            type: 'CREDIT',
-            amount: paidAmount,
-            description: `Initial payment for ${purchase.purchaseNumber} via ${purchaseData.paymentMethod || 'CREDIT'}`
-          }
-        ],
+      const paymentLedgerEntries = await Ledger.createDoubleEntry(orgId, req.user._id, [
         {
-          referenceType: 'PAYMENT',
-          referenceId: purchase._id,
-          referenceModel: 'Purchase',
-          referenceNumber: purchase.purchaseNumber
+          account: 'ACCOUNTS_PAYABLE',
+          type: 'DEBIT',
+          amount: paidAmount,
+          party: 'SUPPLIER',
+          partyId: supplier._id,
+          partyModel: 'Supplier',
+          partyName: supplier.name,
+          description: `Initial payment for ${purchase.purchaseNumber}`
+        },
+        {
+          account: purchaseData.paymentMethod === 'CASH' ? 'CASH' : 'BANK',
+          type: 'CREDIT',
+          amount: paidAmount,
+          description: `Initial payment for ${purchase.purchaseNumber} via ${purchaseData.paymentMethod || 'CREDIT'}`
         }
-      );
+      ], {
+        referenceType: 'PAYMENT',
+        referenceId: purchase._id,
+        referenceModel: 'Purchase',
+        referenceNumber: purchase.purchaseNumber
+      }, session);
 
-      // Create payment entry in payments array
-      const initialPayment = {
+      purchase.payments.push({
         amount: paidAmount,
         paymentMethod: purchaseData.paymentMethod || 'CASH',
         paymentDate: purchaseData.purchaseDate || new Date(),
@@ -328,18 +313,22 @@ router.post('/', async (req, res) => {
         notes: 'Initial payment during purchase creation',
         createdBy: req.user._id,
         createdAt: new Date(),
-        ledgerEntries: paymentLedgerEntries.map(entry => entry._id)
-      };
-
-      purchase.payments.push(initialPayment);
+        ledgerEntries: paymentLedgerEntries.map(e => e._id)
+      });
     }
 
-    await purchase.save();
+    await purchase.save({ session });
+    await session.commitTransaction();
 
-    res.status(201).json(purchase);
+    const response = purchase.toObject();
+    if (zeroPriceWarnings.length > 0) response.warnings = zeroPriceWarnings;
+    res.status(201).json(response);
   } catch (error) {
+    if (session) await session.abortTransaction();
     console.error('Purchase creation error:', error);
     res.status(500).json({ message: error.message });
+  } finally {
+    if (session) session.endSession();
   }
 });
 
@@ -595,18 +584,21 @@ router.put('/:id', async (req, res) => {
     session = await Purchase.startSession();
     session.startTransaction();
 
-    // Apply all batch updates
+    // Apply all batch updates using findByIdAndUpdate to avoid __v optimistic-lock
+    // conflicts that can silently no-op batch.save({ session }) inside a transaction.
     for (const batchUpdate of batchUpdates) {
-      batchUpdate.batch.quantity = batchUpdate.quantity;
-      batchUpdate.batch.purchasePrice = batchUpdate.purchasePrice;
-      batchUpdate.batch.sellingPrice = batchUpdate.sellingPrice;
-      batchUpdate.batch.mrp = batchUpdate.mrp;
-      batchUpdate.batch.gstRate = batchUpdate.gstRate;
-      batchUpdate.batch.expiryDate = batchUpdate.expiryDate;
-      batchUpdate.batch.isActive = batchUpdate.isActive;
-      batchUpdate.batch.depletedAt = batchUpdate.depletedAt;
-
-      await batchUpdate.batch.save({ session });
+      await Batch.findByIdAndUpdate(batchUpdate.batch._id, {
+        $set: {
+          quantity: batchUpdate.quantity,
+          purchasePrice: batchUpdate.purchasePrice,
+          sellingPrice: batchUpdate.sellingPrice,
+          mrp: batchUpdate.mrp,
+          gstRate: batchUpdate.gstRate,
+          expiryDate: batchUpdate.expiryDate,
+          isActive: batchUpdate.isActive,
+          depletedAt: batchUpdate.depletedAt
+        }
+      }, { session });
     }
 
     // Update product stock quantities

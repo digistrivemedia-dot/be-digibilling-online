@@ -149,6 +149,7 @@ router.get('/:id', async (req, res) => {
 // @desc    Create payment (received or paid)
 // @access  Private
 router.post('/', async (req, res) => {
+  let session = null;
   try {
     const {
       type,
@@ -161,18 +162,21 @@ router.post('/', async (req, res) => {
       ...paymentData
     } = req.body;
 
+    const orgId = req.organizationId || req.user.organizationId;
+
+    // ── Validate inputs ───────────────────────────────────────────────────────
+    if (!amount || amount <= 0) {
+      return res.status(400).json({ message: 'Payment amount must be greater than 0' });
+    }
+
     // Validate party
     const PartyModel = partyType === 'CUSTOMER' ? Customer : Supplier;
-    const party = await PartyModel.findOne({
-      _id: partyId,
-      organizationId: req.organizationId
-    });
-
+    const party = await PartyModel.findOne({ _id: partyId, organizationId: req.organizationId });
     if (!party) {
       return res.status(404).json({ message: `${partyType} not found` });
     }
 
-    // Get reference document details if provided
+    // Get reference document details if provided (read-only, before transaction)
     let referenceNumber = '';
     if (referenceType && referenceId) {
       const ReferenceModel = referenceType === 'INVOICE' ? Invoice : Purchase;
@@ -182,11 +186,15 @@ router.post('/', async (req, res) => {
       }
     }
 
-    // Create payment
-    const payment = await Payment.create({
+    // ── START TRANSACTION ─────────────────────────────────────────────────────
+    session = await Payment.startSession();
+    session.startTransaction();
+
+    // Create payment document
+    const [payment] = await Payment.create([{
       ...paymentData,
       userId: req.user._id,
-      organizationId: req.organizationId || req.user.organizationId,
+      organizationId: orgId,
       type,
       partyType,
       party: partyId,
@@ -198,48 +206,46 @@ router.post('/', async (req, res) => {
       referenceId,
       referenceModel: referenceType === 'INVOICE' ? 'Invoice' : (referenceType === 'PURCHASE' ? 'Purchase' : undefined),
       referenceNumber
-    });
+    }], { session });
 
-    // Update party balance
-    if (type === 'RECEIVED') {
-      // Received from customer - reduce outstanding
-      if (partyType === 'CUSTOMER') {
-        party.outstandingBalance = Math.max(0, party.outstandingBalance - amount);
-      }
-    } else {
-      // Paid to supplier - reduce payable
-      if (partyType === 'SUPPLIER') {
-        party.currentBalance = Math.max(0, party.currentBalance - amount);
-      }
+    // Update party balance — clamp at 0 to match original behaviour (never go negative)
+    if (type === 'RECEIVED' && partyType === 'CUSTOMER') {
+      await Customer.findByIdAndUpdate(partyId, [
+        { $set: { outstandingBalance: { $max: [0, { $subtract: ['$outstandingBalance', amount] }] } } }
+      ], { session });
+    } else if (type === 'PAID' && partyType === 'SUPPLIER') {
+      await Supplier.findByIdAndUpdate(partyId, [
+        { $set: { currentBalance: { $max: [0, { $subtract: ['$currentBalance', amount] }] } } }
+      ], { session });
     }
-    await party.save();
 
-    // Update invoice/purchase payment status if referenced
+    // Update referenced invoice/purchase payment status
     if (referenceId && referenceType) {
       const ReferenceModel = referenceType === 'INVOICE' ? Invoice : Purchase;
-      const reference = await ReferenceModel.findById(referenceId);
-
+      const reference = await ReferenceModel.findById(referenceId).session(session);
       if (reference) {
         const newPaidAmount = reference.paidAmount + amount;
         const newBalance = reference.grandTotal - newPaidAmount;
-
         reference.paidAmount = newPaidAmount;
         reference.balanceAmount = newBalance;
         reference.paymentStatus = newBalance <= 0 ? 'PAID' : (newPaidAmount > 0 ? 'PARTIAL' : 'UNPAID');
-
-        await reference.save();
+        await reference.save({ session });
       }
     }
 
     // Post to ledger
-    const ledgerEntries = await postPaymentToLedger(payment, req.user._id, req.organizationId || req.user.organizationId);
+    const ledgerEntries = await postPaymentToLedger(payment, req.user._id, orgId, session);
     payment.ledgerEntries = ledgerEntries.map(entry => entry._id);
-    await payment.save();
+    await payment.save({ session });
 
+    await session.commitTransaction();
     res.status(201).json(payment);
   } catch (error) {
+    if (session) await session.abortTransaction();
     console.error('Payment creation error:', error);
     res.status(500).json({ message: error.message });
+  } finally {
+    if (session) session.endSession();
   }
 });
 

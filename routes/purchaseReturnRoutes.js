@@ -116,81 +116,88 @@ router.get('/:id', async (req, res) => {
   }
 });
 
+// Valid reason codes (must match PurchaseReturn model enum)
+const VALID_PURCHASE_RETURN_REASONS = ['DAMAGED', 'EXPIRED', 'WRONG_ITEM', 'QUALITY_ISSUE', 'EXCESS_STOCK', 'OTHER'];
+
 // @route   POST /api/purchase-returns
 // @desc    Create purchase return (Debit Note)
 // @access  Private
 router.post('/', async (req, res) => {
+  let session = null;
   try {
     const { originalPurchase: purchaseId, items, reason, reasonDescription } = req.body;
+    const orgId = req.organizationId || req.user.organizationId;
+
+    // BUG-009: Validate reason before any DB writes
+    if (!reason || !VALID_PURCHASE_RETURN_REASONS.includes(reason)) {
+      return res.status(400).json({
+        message: `Invalid return reason. Must be one of: ${VALID_PURCHASE_RETURN_REASONS.join(', ')}`
+      });
+    }
 
     // Validate original purchase
     const purchase = await Purchase.findOne(addOrgFilter(req, { _id: purchaseId }))
       .populate('supplier');
-
     if (!purchase) {
       return res.status(404).json({ message: 'Original purchase not found' });
     }
 
-    // Process return items
-    const processedItems = [];
+    // ── Pre-validate all items (no DB writes yet) ─────────────────────────────
+    const validatedItems = [];
     for (const item of items) {
-      // Extract batch ID if batch is an object (frontend might send full batch object)
       const batchId = item.batch?._id || item.batch;
       const productId = item.product?._id || item.product;
 
-      // Find original purchase item
-      // Match by batch if available, otherwise match by product
       let originalItem;
       if (batchId) {
-        originalItem = purchase.items.find(
-          pi => pi.batch && pi.batch.toString() === batchId.toString()
-        );
+        originalItem = purchase.items.find(pi => pi.batch && pi.batch.toString() === batchId.toString());
       } else {
-        originalItem = purchase.items.find(
-          pi => pi.product.toString() === productId.toString()
-        );
+        originalItem = purchase.items.find(pi => pi.product.toString() === productId.toString());
       }
-
       if (!originalItem) {
-        throw new Error('Item not found in original purchase');
+        return res.status(400).json({ message: 'Item not found in original purchase' });
       }
-
-      // Validate return quantity
       if (item.quantity > originalItem.quantity) {
-        throw new Error(`Cannot return more than purchased quantity for item`);
+        return res.status(400).json({ message: `Cannot return more than purchased quantity for item` });
       }
 
-      // Calculate GST for return item (pass 'purchase' context)
       const itemWithGST = calculateItemGST({
         ...item,
         purchasePrice: originalItem.purchasePrice,
         gstRate: originalItem.gstRate
       }, purchase.taxType, 'purchase');
 
-      // Deduct from batch inventory (removing returned stock) - only if batch exists
-      if (batchId) {
-        await deductBatchStock(batchId, item.quantity);
-      }
-
-      processedItems.push({
-        ...itemWithGST,
-        product: originalItem.product,
-        productName: originalItem.productName,
-        batch: batchId || null,
-        batchNo: originalItem.batchNo,
-        expiryDate: originalItem.expiryDate,
-        hsnCode: originalItem.hsnCode,
-        unit: originalItem.unit
-      });
+      validatedItems.push({ item, itemWithGST, originalItem, batchId });
     }
 
-    // Calculate totals
+    const processedItems = validatedItems.map(({ itemWithGST, originalItem, batchId }) => ({
+      ...itemWithGST,
+      product: originalItem.product,
+      productName: originalItem.productName,
+      batch: batchId || null,
+      batchNo: originalItem.batchNo,
+      expiryDate: originalItem.expiryDate,
+      hsnCode: originalItem.hsnCode,
+      unit: originalItem.unit
+    }));
+
     const totals = calculateTotals(processedItems, {}, 0);
 
-    // Create purchase return
-    const purchaseReturn = await PurchaseReturn.create({
+    // ── START TRANSACTION ─────────────────────────────────────────────────────
+    session = await PurchaseReturn.startSession();
+    session.startTransaction();
+
+    // Deduct returned stock from batches
+    for (const { item, batchId } of validatedItems) {
+      if (batchId) {
+        await deductBatchStock(batchId, item.quantity, session);
+      }
+    }
+
+    // Create purchase return document
+    const purchaseReturn = new PurchaseReturn({
       userId: req.user._id,
-      organizationId: req.organizationId || req.user.organizationId,
+      organizationId: orgId,
       supplier: purchase.supplier._id,
       supplierName: purchase.supplierName,
       supplierGstin: purchase.supplierGstin,
@@ -202,29 +209,33 @@ router.post('/', async (req, res) => {
       taxType: purchase.taxType,
       ...totals
     });
+    await purchaseReturn.save({ session });
 
     // Update original purchase
     purchase.isReturned = true;
     purchase.returnedAmount += totals.grandTotal;
-    await purchase.save();
+    await purchase.save({ session });
 
     // Update supplier balance
-    const supplier = await Supplier.findById(purchase.supplier);
-    if (supplier) {
-      supplier.currentBalance -= totals.grandTotal;
-      supplier.totalReturns += totals.grandTotal;
-      await supplier.save();
+    if (purchase.supplier?._id) {
+      await Supplier.findByIdAndUpdate(purchase.supplier._id, {
+        $inc: { currentBalance: -totals.grandTotal, totalReturns: totals.grandTotal }
+      }, { session });
     }
 
     // Post to ledger
-    const ledgerEntries = await postPurchaseReturnToLedger(purchaseReturn, req.user._id, req.organizationId || req.user.organizationId);
+    const ledgerEntries = await postPurchaseReturnToLedger(purchaseReturn, req.user._id, orgId, session);
     purchaseReturn.ledgerEntries = ledgerEntries.map(entry => entry._id);
-    await purchaseReturn.save();
+    await purchaseReturn.save({ session });
 
+    await session.commitTransaction();
     res.status(201).json(purchaseReturn);
   } catch (error) {
+    if (session) await session.abortTransaction();
     console.error('Purchase return error:', error);
     res.status(500).json({ message: error.message });
+  } finally {
+    if (session) session.endSession();
   }
 });
 

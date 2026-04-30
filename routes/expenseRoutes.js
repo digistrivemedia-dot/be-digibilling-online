@@ -2,7 +2,8 @@ import express from 'express';
 import Expense from '../models/Expense.js';
 import { protect } from '../middleware/auth.js';
 import { tenantIsolation, addOrgFilter } from '../middleware/tenantIsolation.js';
-import { calculateGST } from '../utils/gstCalculations.js';
+import { calculateGST, determineTaxType } from '../utils/gstCalculations.js';
+import ShopSettings from '../models/ShopSettings.js';
 import { postExpenseToLedger } from '../utils/ledgerHelper.js';
 import mongoose from 'mongoose';
 
@@ -150,7 +151,14 @@ router.get('/:id', async (req, res) => {
 // @access  Private
 router.post('/', async (req, res) => {
   try {
-    const { amount, isGSTApplicable, gstRate, ...expenseData } = req.body;
+    const { amount, isGSTApplicable, gstRate, taxType: reqTaxType, ...expenseData } = req.body;
+
+    // BUG-013: Determine tax type from request or shop settings (not hardcoded CGST/SGST)
+    let taxType = reqTaxType;
+    if (!taxType) {
+      const shopSettings = await ShopSettings.findOne({ organizationId: req.organizationId || req.user.organizationId }).lean();
+      taxType = determineTaxType(shopSettings?.state, null) || 'CGST_SGST';
+    }
 
     let gstAmount = 0;
     let cgst = 0;
@@ -160,7 +168,7 @@ router.post('/', async (req, res) => {
 
     // Calculate GST if applicable
     if (isGSTApplicable && gstRate) {
-      const gstCalc = calculateGST(amount, gstRate, 'CGST_SGST'); // Default to CGST/SGST
+      const gstCalc = calculateGST(amount, gstRate, taxType);
       gstAmount = gstCalc.totalTax;
       cgst = gstCalc.cgst;
       sgst = gstCalc.sgst;
@@ -214,7 +222,8 @@ router.put('/:id', async (req, res) => {
       const gstRate = req.body.gstRate ?? expense.gstRate;
 
       if (isGSTApplicable && gstRate) {
-        const gstCalc = calculateGST(amount, gstRate, 'CGST_SGST');
+        const taxType = req.body.taxType || expense.taxType || 'CGST_SGST';
+        const gstCalc = calculateGST(amount, gstRate, taxType);
         expense.gstAmount = gstCalc.totalTax;
         expense.cgst = gstCalc.cgst;
         expense.sgst = gstCalc.sgst;
