@@ -1189,29 +1189,65 @@ router.delete('/:id', async (req, res) => {
       });
     }
 
+    // Block deletion if any stock from this purchase has already been sold.
+    // Each purchase item stores how much it contributed to its batch.
+    // If the batch's current quantity is less than that contribution, some
+    // units were already consumed by invoices and deleting would corrupt stock.
+    for (const item of purchase.items) {
+      if (!item.batch) continue;
+      const purchaseQty = item.quantity + (item.freeQuantity || 0);
+      const currentBatchQty = item.batch.quantity ?? 0;
+      if (currentBatchQty < purchaseQty) {
+        return res.status(400).json({
+          message: `Cannot delete: stock from batch "${item.batch.batchNo || item.batch._id}" has already been partially sold. This purchase added ${purchaseQty} units but only ${currentBatchQty} remain. Delete or edit the related invoices first.`
+        });
+      }
+    }
+
     // Start transaction
     session = await Purchase.startSession();
     session.startTransaction();
 
-    // Delete all batches associated with this purchase
     const Batch = (await import('../models/Batch.js')).default;
-    const batchIds = purchase.items.map(item => item.batch).filter(Boolean);
-
-    if (batchIds.length > 0) {
-      await Batch.deleteMany({ _id: { $in: batchIds } }, { session });
-    }
-
-    // Update product stock quantities
     const { updateProductTotalStock } = await import('../utils/inventoryManager.js');
+
+    // Subtract only this purchase's contribution from each batch.
+    // Do NOT delete the batch outright — it may be shared with other purchases
+    // that used the same batchNo + product combination.
+    const updatedProductIds = new Set();
     for (const item of purchase.items) {
-      if (item.product && item.product._id) {
-        await updateProductTotalStock(
-          item.product._id,
-          req.user._id,
-          req.organizationId || req.user.organizationId,
-          session
+      if (!item.batch) continue;
+
+      const purchaseQty = item.quantity + (item.freeQuantity || 0);
+      const newQty = (item.batch.quantity ?? 0) - purchaseQty;
+
+      if (newQty <= 0) {
+        // This purchase was the sole contributor — deactivate the batch
+        await Batch.findByIdAndUpdate(
+          item.batch._id,
+          { $set: { quantity: 0, isActive: false, depletedAt: new Date() } },
+          { session }
+        );
+      } else {
+        // Shared batch — reduce by exactly what this purchase added
+        await Batch.findByIdAndUpdate(
+          item.batch._id,
+          { $inc: { quantity: -purchaseQty } },
+          { session }
         );
       }
+
+      if (item.product?._id) updatedProductIds.add(item.product._id.toString());
+    }
+
+    // Recompute product stock from remaining active batches
+    for (const productId of updatedProductIds) {
+      await updateProductTotalStock(
+        productId,
+        req.user._id,
+        req.organizationId || req.user.organizationId,
+        session
+      );
     }
 
     // Delete ledger entries
