@@ -5,9 +5,12 @@ import { tenantIsolation, addOrgFilter } from '../middleware/tenantIsolation.js'
 
 const router = express.Router();
 
-router.use('/public', (req, res, next) => next()); // Skip auth for public routes
-router.use(protect);
-router.use(tenantIsolation);
+const getOrganizationId = (req) => (
+  req.organizationId ||
+  req.user?.organizationId?._id ||
+  req.user?.organizationId ||
+  null
+);
 
 // @route   GET /api/shop/public/name
 // @desc    Get shop name (public access for login/signup pages)
@@ -22,12 +25,20 @@ router.get('/public/name', async (req, res) => {
   }
 });
 
+router.use(protect);
+router.use(tenantIsolation);
+
 // @route   GET /api/shop
 // @desc    Get shop settings
 // @access  Private
 router.get('/', async (req, res) => {
   try {
-    const settings = await ShopSettings.findOne({ organizationId: req.organizationId });
+    const organizationId = getOrganizationId(req);
+    if (!organizationId) {
+      return res.status(403).json({ message: 'Access denied. No organization context.' });
+    }
+
+    const settings = await ShopSettings.findOne(addOrgFilter({ ...req, organizationId }));
     res.json(settings);
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -39,14 +50,20 @@ router.get('/', async (req, res) => {
 // @access  Private
 router.post('/', async (req, res) => {
   try {
-    let settings = await ShopSettings.findOne({ organizationId: req.organizationId });
+    const organizationId = getOrganizationId(req);
+    if (!organizationId) {
+      return res.status(403).json({ message: 'Access denied. No organization context.' });
+    }
+
+    const orgReq = { ...req, organizationId };
+    let settings = await ShopSettings.findOne(addOrgFilter(orgReq));
 
     if (settings) {
       // Partial update — only update the fields sent in the request body
       // Using $set ensures we don't wipe fields not included in this request
       // runValidators is intentionally omitted to allow partial saves
       settings = await ShopSettings.findOneAndUpdate(
-        { organizationId: req.organizationId },
+        addOrgFilter(orgReq),
         { $set: { ...req.body, userId: req.user._id } },
         { new: true }
       );
@@ -58,7 +75,7 @@ router.post('/', async (req, res) => {
       settings = await ShopSettings.create({
         ...req.body,
         userId: req.user._id,
-        organizationId: req.organizationId
+        organizationId
       });
     }
 
